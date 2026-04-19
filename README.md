@@ -48,7 +48,9 @@ which chromedriver
 Expected output (example):
 
 /usr/bin/chromium
+
 /usr/bin/chromedriver
+
 Python dependencies
 --------------------
 Create a virtual environment (recommended):
