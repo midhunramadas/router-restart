@@ -36,11 +36,13 @@ Install Chromium and Chromedriver:
 ---------------------------------
 
 sudo apt update
+
 sudo apt install chromium chromium-driver
 
 Verify installation:
 -------------------
 which chromium
+
 which chromedriver
 
 Expected output (example):
@@ -50,7 +52,9 @@ Expected output (example):
 Python dependencies
 --------------------
 Create a virtual environment (recommended):
+
 python3 -m venv venv
+
 source venv/bin/activate
 
 Install required packages:
@@ -72,23 +76,31 @@ AIRTEL_ROUTER_PASSWORD=your_password
 Run the script:
 
 python3 router-restart.py
+
 🪵 Logging
 --------------
 Logs are written to:
 
 /var/log/router-reboot.log
-Important
 
+Important
+--
 Writing to /var/log requires elevated permissions.
 
 Option 1: Run with sudo
+
 sudo python3 router-restart.py
 Option 2: Grant permissions
+
 sudo touch /var/log/router-reboot.log
+
 sudo chown pihole:pihole /var/log/router-reboot.log
+
 🧹 Log Management
+--
 Logs are automatically truncated once per week (Sunday)
 Uses a stamp file to ensure truncation happens only once per week
+
 ⏱️ Automate with Cron
 ---------------------
 To run daily at 3 AM:
@@ -103,25 +115,32 @@ Add:
 
 ⚠️ Notes
 ---------
-This script uses Selenium because Airtel routers typically don’t expose a public reboot API
-UI changes in router firmware may break element selectors
-Tested on Raspberry Pi OS (ARM64)
+- This script uses Selenium because Airtel routers typically don’t expose a public reboot API
+- UI changes in router firmware may break element selectors
+- Tested on Raspberry Pi OS (ARM64)
+
 🛠️ Troubleshooting
 ------------------
 ❌ AIRTEL_ROUTER_IP not set in .env
+
 Ensure .env is in the same directory as the script
+
 Ensure variable names match exactly
 
 Avoid spaces:
 ------------
 AIRTEL_ROUTER_IP=10.1.1.1  ✅
+
 AIRTEL_ROUTER_IP = 10.1.1.1 ❌
+
 ❌ Selenium / Chromium errors
 
 Ensure correct paths:
-
+--
 options.binary_location = "/usr/bin/chromium"
+
 service = Service("/usr/bin/chromedriver")
+
 ❌ Permission denied for logs
 
 Run with sudo or fix ownership of /var/log/router-reboot.log
