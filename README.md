@@ -90,6 +90,7 @@ Writing to /var/log requires elevated permissions.
 Option 1: Run with sudo
 
 sudo python3 router-restart.py
+
 Option 2: Grant permissions
 
 sudo touch /var/log/router-reboot.log
