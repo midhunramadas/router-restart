@@ -21,8 +21,11 @@ This script logs into the router’s web UI, triggers a reboot, and monitors whe
 📂 Project Structure
 --------------------
 router-restart/
+
 ├── router-restart.py
+
 ├── .env
+
 └── README.md
 
 ⚙️ Requirements
@@ -45,25 +48,27 @@ Expected output (example):
 /usr/bin/chromium
 /usr/bin/chromedriver
 Python dependencies
-
+--------------------
 Create a virtual environment (recommended):
--------------------------------------------
 python3 -m venv venv
 source venv/bin/activate
 
 Install required packages:
 -------------------------
-
 pip install selenium python-dotenv
-🔐 Configuration
 
+🔐 Configuration
+----------------
 Create a .env file in the project directory:
 ------------------------------------------
 AIRTEL_ROUTER_IP=10.1.1.1
-AIRTEL_ROUTER_USERNAME=admin
-AIRTEL_ROUTER_PASSWORD=your_password
-▶️ Usage
 
+AIRTEL_ROUTER_USERNAME=admin
+
+AIRTEL_ROUTER_PASSWORD=your_password
+
+▶️ Usage
+---
 Run the script:
 
 python3 router-restart.py
