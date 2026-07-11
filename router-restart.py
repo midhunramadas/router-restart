@@ -1,5 +1,5 @@
 """
-Airtel router reboot automation for Raspberry Pi Zero 2 W.
+Airtel router reboot automation.
   - Fixed the double driver.quit() bug (was called in both except and finally)
   - Added low-memory Chromium flags to reduce crash rate on the Pi Zero 2 W
   - Added a pre-flight memory check that aborts early (with a clear log message)
