@@ -4,8 +4,7 @@ Airtel router reboot automation.
   - Added low-memory Chromium flags to reduce crash rate on the Pi Zero 2 W
   - Added a pre-flight memory check that aborts early (with a clear log message)
     instead of letting Chromium OOM-crash mid-login
-  - Wrapped each Selenium step with a small retry helper, since flaky waits are
-    the most common failure mode under memory pressure
+  - Retries element waits without replaying state-changing clicks
   - Handles the reboot confirmation as EITHER a DOM button OR a JS confirm()
     alert, since Airtel firmware varies on this and it's a common silent-failure
     point
@@ -25,6 +24,8 @@ from selenium.common.exceptions import (
     TimeoutException,
     WebDriverException,
     NoAlertPresentException,
+    StaleElementReferenceException,
+    UnexpectedAlertPresentException,
 )
 
 import time
@@ -33,70 +34,75 @@ import sys
 import subprocess
 import platform
 import logging
-from datetime import datetime
+import fcntl
+from dataclasses import dataclass
+from logging.handlers import RotatingFileHandler
+from urllib.error import HTTPError, URLError
+from urllib.request import Request, urlopen
 from dotenv import load_dotenv
 
 # ---------------- CONFIG ---------------- #
 
-load_dotenv()
+@dataclass(frozen=True)
+class Config:
+    router_ip: str
+    username: str
+    password: str
+    log_file: str
+    chromium_binary: str
+    chromedriver_binary: str
 
-AIRTEL_ROUTER_IP = os.getenv("AIRTEL_ROUTER_IP")
-USERNAME = os.getenv("AIRTEL_ROUTER_USERNAME")
-PASSWORD = os.getenv("AIRTEL_ROUTER_PASSWORD")
 
-if not AIRTEL_ROUTER_IP:
-    raise ValueError("AIRTEL_ROUTER_IP not set in .env")
-if not USERNAME or not PASSWORD:
-    raise ValueError("Router credentials missing in .env")
-
-LOG_FILE = "/var/log/router-reboot.log"
-STAMP_FILE = "/tmp/router_reboot_log_reset"
+def load_config() -> Config:
+    """Load configuration at run time so importing this module remains testable."""
+    load_dotenv()
+    router_ip = os.getenv("AIRTEL_ROUTER_IP")
+    username = os.getenv("AIRTEL_ROUTER_USERNAME")
+    password = os.getenv("AIRTEL_ROUTER_PASSWORD")
+    if not router_ip:
+        raise ValueError("AIRTEL_ROUTER_IP not set in .env")
+    if not username or not password:
+        raise ValueError("Router credentials missing in .env")
+    return Config(
+        router_ip=router_ip,
+        username=username,
+        password=password,
+        log_file=os.getenv("ROUTER_REBOOT_LOG_FILE", "/var/log/router-reboot.log"),
+        chromium_binary=os.getenv("CHROMIUM_BINARY", "/usr/bin/chromium"),
+        chromedriver_binary=os.getenv("CHROMEDRIVER_BINARY", "/usr/bin/chromedriver"),
+    )
 
 WAIT_TIMEOUT = 10          # seconds, per-element wait
 STEP_RETRIES = 2           # retries per Selenium step before giving up
 MIN_FREE_MB = 80           # abort if free memory drops below this before launch
 OFFLINE_POLL_INTERVAL = 5  # seconds
+OFFLINE_MAX_ATTEMPTS = 24  # 24 * 5s = 2 minutes
 ONLINE_MAX_ATTEMPTS = 20   # 20 * 30s = 10 minutes
 ONLINE_POLL_INTERVAL = 30  # seconds
+LOCK_FILE = "/tmp/router-reboot.lock"
+LOGGER = logging.getLogger("router_reboot")
 
 
 # ---------------- LOGGING SETUP ---------------- #
 
-def should_truncate() -> bool:
-    """Ensure log truncation happens only once per week."""
-    current_week = datetime.now().strftime("%Y-%U")
-    try:
-        if os.path.exists(STAMP_FILE):
-            with open(STAMP_FILE, "r") as f:
-                if f.read().strip() == current_week:
-                    return False
-        with open(STAMP_FILE, "w") as f:
-            f.write(current_week)
-        return True
-    except OSError:
-        return False
+def setup_logging(log_file: str) -> None:
+    """Configure console logging and rotate the file log when it is writable."""
+    LOGGER.setLevel(logging.INFO)
+    LOGGER.propagate = False
+    for handler in LOGGER.handlers[:]:
+        LOGGER.removeHandler(handler)
+        handler.close()
 
-
-def setup_logging() -> None:
-    if datetime.now().weekday() == 6 and should_truncate():
-        try:
-            with open(LOG_FILE, "w"):
-                pass
-        except PermissionError:
-            print("Warning: no permission to truncate log file")
-
-    logger = logging.getLogger()
-    logger.setLevel(logging.INFO)
     fmt = logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
-
-    file_handler = logging.FileHandler(LOG_FILE)
-    file_handler.setFormatter(fmt)
-    logger.addHandler(file_handler)
-
-    # Console output too, useful when running over SSH for testing
     console_handler = logging.StreamHandler(sys.stdout)
     console_handler.setFormatter(fmt)
-    logger.addHandler(console_handler)
+    LOGGER.addHandler(console_handler)
+    try:
+        file_handler = RotatingFileHandler(log_file, maxBytes=1_000_000, backupCount=4)
+        file_handler.setFormatter(fmt)
+        LOGGER.addHandler(file_handler)
+    except OSError as exc:
+        LOGGER.warning("Cannot write log file %s; using console only: %s", log_file, exc)
 
 
 # ---------------- UTIL ---------------- #
@@ -104,9 +110,29 @@ def setup_logging() -> None:
 def ping(host: str) -> bool:
     param = "-n" if platform.system().lower() == "windows" else "-c"
     command = ["ping", param, "1", host]
-    return subprocess.call(
-        command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
-    ) == 0
+    try:
+        return subprocess.run(
+            command,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=3,
+            check=False,
+        ).returncode == 0
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+
+
+def router_web_ready(router_ip: str) -> bool:
+    """Return whether the router's management HTTP service is responding."""
+    request = Request(f"http://{router_ip}/", method="GET")
+    try:
+        with urlopen(request, timeout=3):
+            return True
+    except HTTPError:
+        # Authentication errors still prove that the management service is up.
+        return True
+    except (URLError, OSError):
+        return False
 
 
 def free_memory_mb() -> int:
@@ -121,24 +147,24 @@ def free_memory_mb() -> int:
     return -1  # unknown; don't block the run on a read failure
 
 
-def retry_step(description: str, action, retries: int = STEP_RETRIES):
-    """Run a Selenium step, retrying on timeout/stale-element style failures."""
+def retry_wait(description: str, action, retries: int = STEP_RETRIES):
+    """Retry only idempotent element waits; callers perform clicks once."""
     last_exc = None
     for attempt in range(1, retries + 2):
         try:
             return action()
-        except (TimeoutException, WebDriverException) as e:
+        except (TimeoutException, StaleElementReferenceException) as e:
             last_exc = e
-            logging.warning(f"{description} failed (attempt {attempt}): {e}")
+            LOGGER.warning("%s failed (attempt %s): %s", description, attempt, e)
             time.sleep(2)
     raise RuntimeError(f"{description} failed after {retries + 1} attempts") from last_exc
 
 
 # ---------------- SELENIUM FLOW ---------------- #
 
-def build_driver() -> webdriver.Chrome:
+def build_driver(config: Config) -> webdriver.Chrome:
     options = webdriver.ChromeOptions()
-    options.binary_location = "/usr/bin/chromium"
+    options.binary_location = config.chromium_binary
 
     options.add_argument("--headless=new")
     options.add_argument("--no-sandbox")
@@ -163,27 +189,35 @@ def build_driver() -> webdriver.Chrome:
     # are the safe way to keep the footprint down.
 
     service = Service(
-        "/usr/bin/chromedriver",
+        config.chromedriver_binary,
         log_output="/tmp/chromedriver.log",
         service_args=["--verbose"],
     )
-    return webdriver.Chrome(service=service, options=options)
+    driver = webdriver.Chrome(service=service, options=options)
+    driver.set_page_load_timeout(WAIT_TIMEOUT)
+    driver.set_script_timeout(WAIT_TIMEOUT)
+    return driver
 
 
-def do_login(driver) -> None:
-    driver.get(f"http://{AIRTEL_ROUTER_IP}/")
+def do_login(driver, config: Config) -> None:
+    driver.get(f"http://{config.router_ip}/")
 
-    username_field = retry_step(
+    username_field = retry_wait(
         "locate username field",
         lambda: WebDriverWait(driver, WAIT_TIMEOUT).until(
             EC.presence_of_element_located((By.NAME, "Frm_Username"))
         ),
     )
-    password_field = driver.find_element(By.NAME, "Frm_Password")
-    username_field.send_keys(USERNAME)
-    password_field.send_keys(PASSWORD)
+    password_field = retry_wait(
+        "locate password field",
+        lambda: WebDriverWait(driver, WAIT_TIMEOUT).until(
+            EC.presence_of_element_located((By.NAME, "Frm_Password"))
+        ),
+    )
+    username_field.send_keys(config.username)
+    password_field.send_keys(config.password)
 
-    login_button = retry_step(
+    login_button = retry_wait(
         "locate login button",
         lambda: WebDriverWait(driver, WAIT_TIMEOUT).until(
             EC.element_to_be_clickable((By.ID, "LoginId"))
@@ -191,125 +225,147 @@ def do_login(driver) -> None:
     )
     login_button.click()
 
-    WebDriverWait(driver, WAIT_TIMEOUT).until(
-        EC.presence_of_element_located((By.ID, "mgrAndDiag"))
+    retry_wait(
+        "wait for authenticated page",
+        lambda: WebDriverWait(driver, WAIT_TIMEOUT).until(
+            EC.presence_of_element_located((By.ID, "mgrAndDiag"))
+        ),
     )
 
 
 def do_reboot(driver) -> None:
-    retry_step(
-        "click mgrAndDiag",
-        lambda: WebDriverWait(driver, WAIT_TIMEOUT).until(
-            EC.element_to_be_clickable((By.ID, "mgrAndDiag"))
-        ).click(),
-    )
-
-    retry_step(
-        "click devMgr",
-        lambda: WebDriverWait(driver, WAIT_TIMEOUT).until(
-            EC.element_to_be_clickable((By.ID, "devMgr"))
-        ).click(),
-    )
-
-    retry_step(
-        "click Btn_restart",
-        lambda: WebDriverWait(driver, WAIT_TIMEOUT).until(
-            EC.element_to_be_clickable((By.ID, "Btn_restart"))
-        ).click(),
-    )
+    for description, element_id in (
+        ("mgrAndDiag", "mgrAndDiag"),
+        ("devMgr", "devMgr"),
+        ("Btn_restart", "Btn_restart"),
+    ):
+        button = retry_wait(
+            f"locate {description}",
+            lambda element_id=element_id: WebDriverWait(driver, WAIT_TIMEOUT).until(
+                EC.element_to_be_clickable((By.ID, element_id))
+            ),
+        )
+        button.click()
 
     confirm_reboot(driver)
 
 
 def confirm_reboot(driver) -> None:
     """
-    Some Airtel firmware versions confirm the reboot via a DOM button
-    (#confirmOK); others use a native JS confirm() dialog. Try the DOM
-    button first, and fall back to a JS alert if it's not there.
+    Some Airtel firmware versions confirm via a DOM button (#confirmOK), while
+    others use a native JS confirm() dialog. Check the alert first because it
+    blocks all DOM interactions while present.
     """
+    if accept_alert(driver, 1):
+        return
+
     try:
         WebDriverWait(driver, WAIT_TIMEOUT).until(
             EC.element_to_be_clickable((By.ID, "confirmOK"))
         ).click()
-        logging.info("Confirmed reboot via DOM button")
+        LOGGER.info("Confirmed reboot via DOM button")
         return
-    except TimeoutException:
-        pass
-
-    try:
-        WebDriverWait(driver, 3).until(EC.alert_is_present())
-        driver.switch_to.alert.accept()
-        logging.info("Confirmed reboot via JS alert")
-        return
-    except (TimeoutException, NoAlertPresentException):
-        pass
-
+    except (TimeoutException, UnexpectedAlertPresentException):
+        if accept_alert(driver, 3):
+            return
     raise RuntimeError("Could not find a reboot confirmation dialog (neither DOM button nor JS alert)")
 
 
-def run_selenium_flow() -> None:
+def accept_alert(driver, timeout: int) -> bool:
+    try:
+        WebDriverWait(driver, timeout).until(EC.alert_is_present())
+        driver.switch_to.alert.accept()
+        LOGGER.info("Confirmed reboot via JS alert")
+        return True
+    except (TimeoutException, NoAlertPresentException):
+        return False
+
+
+def run_selenium_flow(config: Config) -> None:
     driver = None
     try:
-        driver = build_driver()
-        do_login(driver)
+        driver = build_driver(config)
+        do_login(driver, config)
         do_reboot(driver)
-        logging.info("Reboot command sent")
+        LOGGER.info("Reboot command sent")
     finally:
         # Single, guaranteed cleanup path - fixes the old double driver.quit() bug
         if driver is not None:
             try:
                 driver.quit()
             except WebDriverException as e:
-                logging.warning(f"driver.quit() raised during cleanup (safe to ignore): {e}")
+                LOGGER.warning("driver.quit() raised during cleanup (safe to ignore): %s", e)
 
 
 # ---------------- REBOOT MONITOR ---------------- #
 
-def wait_for_offline() -> None:
-    logging.info("Waiting for router to go offline...")
-    while ping(AIRTEL_ROUTER_IP):
+def wait_for_offline(router_ip: str) -> bool:
+    LOGGER.info("Waiting for router to go offline...")
+    for _ in range(OFFLINE_MAX_ATTEMPTS):
+        if not ping(router_ip) or not router_web_ready(router_ip):
+            LOGGER.info("Router is offline, waiting to come back online...")
+            return True
         time.sleep(OFFLINE_POLL_INTERVAL)
-    logging.info("Router is offline, waiting to come back online...")
+    LOGGER.error("Router did not go offline within %s seconds", OFFLINE_MAX_ATTEMPTS * OFFLINE_POLL_INTERVAL)
+    return False
 
 
-def wait_for_online() -> bool:
+def wait_for_online(router_ip: str) -> bool:
     for attempt in range(1, ONLINE_MAX_ATTEMPTS + 1):
         time.sleep(ONLINE_POLL_INTERVAL)
-        if ping(AIRTEL_ROUTER_IP):
-            logging.info(f"Router is back online after {attempt * ONLINE_POLL_INTERVAL} seconds")
+        if ping(router_ip) and router_web_ready(router_ip):
+            LOGGER.info("Router is back online after %s seconds", attempt * ONLINE_POLL_INTERVAL)
             return True
-        logging.warning(f"Attempt {attempt}/{ONLINE_MAX_ATTEMPTS}... still down")
-    logging.error("Router did not come back online")
+        LOGGER.warning("Attempt %s/%s... still down", attempt, ONLINE_MAX_ATTEMPTS)
+    LOGGER.error("Router did not come back online")
     return False
 
 
 # ---------------- MAIN ---------------- #
 
 def main() -> int:
-    setup_logging()
+    try:
+        config = load_config()
+    except ValueError as exc:
+        print(f"Configuration error: {exc}", file=sys.stderr)
+        return 2
 
-    if not ping(AIRTEL_ROUTER_IP):
-        logging.error(f"Router not reachable at {AIRTEL_ROUTER_IP}")
+    setup_logging(config.log_file)
+
+    lock_handle = open(LOCK_FILE, "w")
+    try:
+        fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        LOGGER.error("Another router reboot run is already in progress")
+        lock_handle.close()
         return 1
-
-    mem = free_memory_mb()
-    if mem != -1 and mem < MIN_FREE_MB:
-        logging.error(f"Only {mem}MB free, skipping this run to avoid an OOM crash mid-reboot")
-        return 1
-    if mem != -1:
-        logging.info(f"Free memory before launch: {mem}MB")
-
-    logging.info("Router reboot initiated")
 
     try:
-        run_selenium_flow()
-    except Exception as e:
-        logging.error(f"Failure during Selenium operation: {e}")
-        return 1
+        if not ping(config.router_ip):
+            LOGGER.error("Router not reachable at %s", config.router_ip)
+            return 1
 
-    wait_for_offline()
-    success = wait_for_online()
-    return 0 if success else 1
+        mem = free_memory_mb()
+        if mem != -1 and mem < MIN_FREE_MB:
+            LOGGER.error("Only %sMB free, skipping this run to avoid an OOM crash mid-reboot", mem)
+            return 1
+        if mem != -1:
+            LOGGER.info("Free memory before launch: %sMB", mem)
+
+        LOGGER.info("Router reboot initiated")
+
+        try:
+            run_selenium_flow(config)
+        except Exception:
+            LOGGER.exception("Failure during Selenium operation")
+            return 1
+
+        if not wait_for_offline(config.router_ip):
+            return 1
+        return 0 if wait_for_online(config.router_ip) else 1
+    finally:
+        fcntl.flock(lock_handle.fileno(), fcntl.LOCK_UN)
+        lock_handle.close()
 
 
 if __name__ == "__main__":
