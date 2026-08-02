@@ -74,6 +74,8 @@ def load_config() -> Config:
 
 WAIT_TIMEOUT = 10          # seconds, per-element wait
 STEP_RETRIES = 2           # retries per Selenium step before giving up
+SELENIUM_MAX_ATTEMPTS = 3  # full browser/login/reboot attempts before failing
+SELENIUM_RETRY_DELAY = 5   # seconds between full Selenium attempts
 MIN_FREE_MB = 80           # abort if free memory drops below this before launch
 OFFLINE_POLL_INTERVAL = 5  # seconds
 OFFLINE_MAX_ATTEMPTS = 24  # 24 * 5s = 2 minutes
@@ -354,11 +356,20 @@ def main() -> int:
 
         LOGGER.info("Router reboot initiated")
 
-        try:
-            run_selenium_flow(config)
-        except Exception:
-            LOGGER.exception("Failure during Selenium operation")
-            return 1
+        for attempt in range(1, SELENIUM_MAX_ATTEMPTS + 1):
+            try:
+                run_selenium_flow(config)
+                break
+            except Exception:
+                LOGGER.exception(
+                    "Selenium operation failed (attempt %s/%s)",
+                    attempt,
+                    SELENIUM_MAX_ATTEMPTS,
+                )
+                if attempt == SELENIUM_MAX_ATTEMPTS:
+                    return 1
+                LOGGER.info("Retrying Selenium operation in %s seconds", SELENIUM_RETRY_DELAY)
+                time.sleep(SELENIUM_RETRY_DELAY)
 
         if not wait_for_offline(config.router_ip):
             return 1
