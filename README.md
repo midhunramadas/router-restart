@@ -8,6 +8,7 @@ Automate an Airtel-router reboot from a Raspberry Pi using Selenium and headless
 - Reboot monitoring: detects offline state, then verifies ping **and** HTTP management UI recovery
 - Bounded monitoring: offline detection times out after 2 minutes; online recovery after 10 minutes
 - Low-memory Chromium settings suitable for a Pi Zero 2 W
+- Up to three complete Selenium attempts when browser startup or UI automation fails
 - Rotating logs: up to 1 MB per file, with four retained backups
 - Console-only fallback when the configured log file is not writable
 - Environment-based configuration via `.env`
